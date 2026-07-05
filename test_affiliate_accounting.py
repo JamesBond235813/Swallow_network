@@ -28,6 +28,7 @@ def load_app(db_path, xui_db_path=None, public_payment_base=None):
         os.environ["XUI_INBOUND_ID"] = "2"
     os.environ["SHOP_ADMIN_EMAIL"] = "admin-test@example.com"
     os.environ["SHOP_ADMIN_PASSWORD"] = "admin-test-password"
+    os.environ["FEISHU_PAYMENT_WEBHOOK"] = ""
     spec = importlib.util.spec_from_loader(
         "shop_app_under_test", SourceFileLoader("shop_app_under_test", APP_PATH)
     )
@@ -2809,6 +2810,28 @@ class AffiliateAccountingTest(unittest.TestCase):
             self.assertEqual(tx_row["status"], "paid")
             self.assertIn("TRADE_SUCCESS", tx_row["response_json"])
             self.assertIsNotNone(sub)
+
+    def test_feishu_payment_notification_text_uses_order_email_product_amount_and_paid_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = load_app(os.path.join(tmp, "shop.db"))
+            user_id = app.create_customer_user("buyer@example.com", "password123")
+            con = app.get_db()
+            product_id = con.execute("select id from products where name=? limit 1", ("轻量月付",)).fetchone()["id"]
+            order_id = app.create_order_for_user(user_id, product_id, use_balance=False)
+            paid_at = 1782907200000
+            con.execute(
+                "update orders set status='paid', payment_method='alipay', payment_ref='test-paid', paid_at=?, updated_at=? where id=?",
+                (paid_at, paid_at, order_id),
+            )
+            order = app.payment_notification_order(con, order_id)
+            con.close()
+
+            text = app.feishu_payment_notification_text(order)
+
+            self.assertIn("user id: buyer@example.com", text)
+            self.assertIn("subscribe: 轻量月付", text)
+            self.assertIn("Payment: ¥19.00", text)
+            self.assertIn(f"time: {app.ms_to_datetime(paid_at)}", text)
 
     def test_checkout_mobile_card_uses_compact_payment_summary_layout(self):
         with tempfile.TemporaryDirectory() as tmp:

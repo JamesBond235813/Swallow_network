@@ -148,6 +148,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "Node1 管理前端 <onboarding@resend.dev>")
 PASSWORD_RESET_OPERATOR_EMAIL = os.environ.get("PASSWORD_RESET_OPERATOR_EMAIL", "").strip()
 PASSWORD_RESET_TTL_MS = int(os.environ.get("PASSWORD_RESET_TTL_MS", str(30 * 60 * 1000)))
+FEISHU_PAYMENT_WEBHOOK = os.environ.get("FEISHU_PAYMENT_WEBHOOK", "").strip()
 WECHAT_VERIFY_FILENAME = "5dc498f857ec00ccebf236b3186b6d53.txt"
 WECHAT_VERIFY_CONTENT = "0a2e6a3c93ca0d249330b3622d9765355a4971f8"
 CLASHMI_DOWNLOAD_URLS = {
@@ -3057,6 +3058,67 @@ def create_payment_transaction(con, order_id, provider, amount_cents):
     }
 
 
+def payment_notification_order(con, order_id):
+    return con.execute(
+        f"""
+        select o.*, u.email user_email, {ORDER_PRODUCT_SELECT}
+        from orders o join users u on u.id=o.user_id join products p on p.id=o.product_id
+        where o.id=?
+        """,
+        (order_id,),
+    ).fetchone()
+
+
+def feishu_payment_notification_text(order):
+    amount_cents, currency = order_payment_amount_and_currency(order)
+    paid_at = int(row_value(order, "paid_at", 0) or now_ms())
+    return "\n".join(
+        [
+            f"user id: {row_value(order, 'user_email', '')}",
+            f"subscribe: {order_display_product_name(order)}",
+            f"Payment: {money_currency(amount_cents, currency)}",
+            f"time: {ms_to_datetime(paid_at)}",
+        ]
+    )
+
+
+def send_feishu_payment_notification(order_id):
+    if not FEISHU_PAYMENT_WEBHOOK:
+        return False
+    con = get_db()
+    try:
+        order = payment_notification_order(con, order_id)
+    finally:
+        con.close()
+    if not order:
+        return False
+    payload = {
+        "msg_type": "text",
+        "content": {"text": feishu_payment_notification_text(order)},
+    }
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        FEISHU_PAYMENT_WEBHOOK,
+        data=data,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            if resp.status >= 400:
+                print(f"feishu payment notification failed for order_id={order_id}: HTTP {resp.status} {body}")
+                return False
+    except Exception as exc:
+        print(f"feishu payment notification failed for order_id={order_id}: {exc}")
+        return False
+    return True
+
+
+def notify_real_payment_success(order_id):
+    threading.Thread(target=send_feishu_payment_notification, args=(int(order_id),), daemon=True).start()
+
+
 def normalize_pem_key(value, marker):
     raw = (value or "").strip()
     if not raw:
@@ -3227,7 +3289,7 @@ def reconcile_pending_alipay_payments(user_id=None, order_id=None, limit=20):
                         """,
                         (response_json, paid_at, tx["id"]),
                     )
-                    con.execute(
+                    cursor = con.execute(
                         """
                         update orders
                         set status='paid', payment_method='alipay', payment_ref=?, paid_at=coalesce(paid_at,?), updated_at=?
@@ -3235,7 +3297,8 @@ def reconcile_pending_alipay_payments(user_id=None, order_id=None, limit=20):
                         """,
                         (provider_order_no, paid_at, paid_at, tx["order_id"]),
                     )
-                    order_ids_to_provision.append(int(tx["order_id"]))
+                    if cursor.rowcount:
+                        order_ids_to_provision.append(int(tx["order_id"]))
                 else:
                     con.execute(
                         "update payment_transactions set response_json=?, updated_at=? where id=?",
@@ -3255,6 +3318,7 @@ def reconcile_pending_alipay_payments(user_id=None, order_id=None, limit=20):
     finally:
         con.close()
     for paid_order_id in order_ids_to_provision:
+        notify_real_payment_success(paid_order_id)
         provision_order(paid_order_id)
     return order_ids_to_provision
 
@@ -5179,7 +5243,7 @@ class App(BaseHTTPRequestHandler):
                             """,
                             (response_json, paid_at, tx["id"]),
                         )
-                        con.execute(
+                        cursor = con.execute(
                             """
                             update orders
                             set status='paid', payment_method='alipay', payment_ref=?, paid_at=coalesce(paid_at,?), updated_at=?
@@ -5187,7 +5251,8 @@ class App(BaseHTTPRequestHandler):
                             """,
                             (provider_order_no, paid_at, paid_at, tx["order_id"]),
                         )
-                        order_to_provision = tx["order_id"]
+                        if cursor.rowcount:
+                            order_to_provision = tx["order_id"]
                         response_text = "success"
                 else:
                     con.execute(
@@ -5199,6 +5264,7 @@ class App(BaseHTTPRequestHandler):
         finally:
             con.close()
         if order_to_provision:
+            notify_real_payment_success(order_to_provision)
             provision_order(order_to_provision)
         data = response_text.encode()
         self.send_response(200)
@@ -5253,7 +5319,7 @@ class App(BaseHTTPRequestHandler):
                         """,
                         (response_json, paid_at, tx["id"]),
                     )
-                    con.execute(
+                    cursor = con.execute(
                         """
                         update orders
                         set status='paid',
@@ -5263,7 +5329,8 @@ class App(BaseHTTPRequestHandler):
                         """,
                         (tx["provider_order_no"], paid_at, paid_at, tx["order_id"]),
                     )
-                    order_to_provision = tx["order_id"]
+                    if cursor.rowcount:
+                        order_to_provision = tx["order_id"]
                 elif payment_status in ("failed", "expired", "refunded"):
                     con.execute(
                         "update payment_transactions set status=?, response_json=?, updated_at=? where id=?",
@@ -5285,6 +5352,7 @@ class App(BaseHTTPRequestHandler):
         finally:
             con.close()
         if order_to_provision:
+            notify_real_payment_success(order_to_provision)
             provision_order(order_to_provision)
         data = response_text.encode()
         self.send_response(status_code)
@@ -6357,13 +6425,17 @@ class App(BaseHTTPRequestHandler):
         order_id = int(parts[2])
         action = parts[3]
         con = get_db()
+        should_notify_payment = False
         if action == "mark-paid":
-            con.execute("update orders set status='paid',payment_ref=?,paid_at=?,updated_at=? where id=? and status='pending_payment'", ("manual-" + secrets.token_hex(5), now_ms(), now_ms(), order_id))
+            cursor = con.execute("update orders set status='paid',payment_ref=?,paid_at=?,updated_at=? where id=? and status='pending_payment'", ("manual-" + secrets.token_hex(5), now_ms(), now_ms(), order_id))
+            should_notify_payment = bool(cursor.rowcount)
             con.commit()
         elif action == "cancel":
             con.execute("update orders set status='cancelled',updated_at=? where id=? and status in ('created','pending_payment')", (now_ms(), order_id))
             con.commit()
         con.close()
+        if should_notify_payment:
+            notify_real_payment_success(order_id)
         if action in ("mark-paid", "provision"):
             threading.Timer(2.0, provision_order, args=(order_id,)).start()
         return self.redirect("/admin/orders")
