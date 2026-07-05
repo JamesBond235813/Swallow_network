@@ -1,0 +1,1787 @@
+#!/usr/bin/env python3
+import base64
+import functools
+import hashlib
+import hmac
+import html
+import json
+import os
+import secrets
+import sqlite3
+import subprocess
+import time
+import urllib.parse
+import urllib.error
+import urllib.request
+import uuid
+from http import cookies
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(APP_DIR, "data")
+DB_PATH = os.environ.get("SHOP_DB", os.path.join(DATA_DIR, "shop.db"))
+HOST = os.environ.get("SHOP_HOST", "127.0.0.1")
+PORT = int(os.environ.get("SHOP_PORT", "8088"))
+SESSION_SECRET = os.environ.get("SHOP_SESSION_SECRET", "dev-change-me-" + hashlib.sha256(APP_DIR.encode()).hexdigest())
+
+XUI_MODE = os.environ.get("XUI_MODE", "mock")  # mock, local, ssh
+XUI_DB_PATH = os.environ.get("XUI_DB_PATH", "/etc/x-ui/x-ui.db")
+XUI_INBOUND_ID = int(os.environ.get("XUI_INBOUND_ID", "2"))
+XUI_HOST = os.environ.get("XUI_HOST", "66.94.122.149")
+XUI_SSH_USER = os.environ.get("XUI_SSH_USER", "root")
+XUI_SSH_KEY = os.environ.get("XUI_SSH_KEY", os.path.expanduser("~/.ssh/node1_codex_ed25519"))
+PUBLIC_SUB_BASE = os.environ.get("PUBLIC_SUB_BASE", "https://node1.talking202606.dpdns.org")
+NODE_PUBLIC_HOST = os.environ.get("NODE_PUBLIC_HOST", "node1.talking202606.dpdns.org")
+NODE_DIRECT_PORT = int(os.environ.get("NODE_DIRECT_PORT", "443"))
+NODE_REALITY_PUBLIC_KEY = os.environ.get("NODE_REALITY_PUBLIC_KEY", "cGy_OaXz2OgisdjhtMRYlInK39DZoCtjWlr1S0yyBw0")
+NODE_REALITY_SHORT_ID = os.environ.get("NODE_REALITY_SHORT_ID", "e4142c9df1ea0452")
+NODE_REALITY_SNI = os.environ.get("NODE_REALITY_SNI", "node1.talking202606.dpdns.org")
+NODE_REMARK_PREFIX = os.environ.get("NODE_REMARK_PREFIX", "Node1")
+SHOP_ADMIN_EMAIL = os.environ.get("SHOP_ADMIN_EMAIL", "admin@example.com")
+SHOP_ADMIN_PASSWORD = os.environ.get("SHOP_ADMIN_PASSWORD", "admin123456")
+SHOP_SEED_DEMO_USER = os.environ.get("SHOP_SEED_DEMO_USER", "0") == "1"
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "Node1 管理前端 <onboarding@resend.dev>")
+PASSWORD_RESET_OPERATOR_EMAIL = os.environ.get("PASSWORD_RESET_OPERATOR_EMAIL", "").strip()
+PASSWORD_RESET_TTL_MS = int(os.environ.get("PASSWORD_RESET_TTL_MS", str(30 * 60 * 1000)))
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def one_time_token(prefix="tok"):
+    return prefix + "_" + secrets.token_urlsafe(12).replace("-", "").replace("_", "")
+
+
+def hash_password(password, salt=None):
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 180_000).hex()
+    return f"pbkdf2_sha256${salt}${digest}"
+
+
+def verify_password(password, stored):
+    try:
+        method, salt, digest = stored.split("$", 2)
+    except ValueError:
+        return False
+    if method != "pbkdf2_sha256":
+        return False
+    return hmac.compare_digest(hash_password(password, salt), stored)
+
+
+def money(cents):
+    return f"¥{cents / 100:.2f}"
+
+
+def gb_label(gb):
+    return f"{gb:g} GB"
+
+
+def ms_to_date(ms):
+    if not ms:
+        return "-"
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ms / 1000))
+
+
+def duration_label(days):
+    if days >= 360:
+        return "包年"
+    if days >= 90:
+        return "季度"
+    if days >= 30:
+        return "月付"
+    return f"{days} 天"
+
+
+def get_db():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    con.execute("pragma foreign_keys=on")
+    return con
+
+
+def init_db():
+    con = get_db()
+    con.executescript(
+        """
+        create table if not exists users (
+            id integer primary key autoincrement,
+            email text unique not null,
+            password_hash text not null,
+            role text not null default 'customer',
+            created_at integer not null
+        );
+
+        create table if not exists products (
+            id integer primary key autoincrement,
+            name text not null,
+            billing_period text not null,
+            duration_days integer not null,
+            traffic_gb integer not null,
+            price_cents integer not null,
+            active integer not null default 1,
+            sort_order integer not null default 100,
+            created_at integer not null,
+            updated_at integer not null
+        );
+
+        create table if not exists orders (
+            id integer primary key autoincrement,
+            order_no text unique not null,
+            user_id integer not null references users(id),
+            product_id integer not null references products(id),
+            amount_cents integer not null,
+            status text not null,
+            payment_method text not null default 'manual',
+            payment_ref text,
+            paid_at integer,
+            provisioned_at integer,
+            created_at integer not null,
+            updated_at integer not null
+        );
+
+        create table if not exists subscriptions (
+            id integer primary key autoincrement,
+            user_id integer not null references users(id),
+            order_id integer not null references orders(id),
+            product_id integer not null references products(id),
+            email_label text not null,
+            sub_id text not null,
+            uuid text not null,
+            traffic_bytes integer not null,
+            expires_at integer not null,
+            clash_url text not null,
+            universal_url text not null,
+            xui_status text not null,
+            xui_message text,
+            created_at integer not null
+        );
+
+        create table if not exists password_reset_tokens (
+            id integer primary key autoincrement,
+            user_id integer not null references users(id),
+            token_hash text unique not null,
+            expires_at integer not null,
+            used_at integer,
+            created_at integer not null
+        );
+
+        create index if not exists idx_password_reset_tokens_hash
+        on password_reset_tokens(token_hash);
+
+        create index if not exists idx_password_reset_tokens_user
+        on password_reset_tokens(user_id);
+
+        create table if not exists payment_settings (
+            provider text primary key,
+            enabled integer not null default 0,
+            config_json text not null default '{}',
+            created_at integer not null,
+            updated_at integer not null
+        );
+
+        create table if not exists payment_transactions (
+            id integer primary key autoincrement,
+            order_id integer not null references orders(id),
+            provider text not null,
+            provider_order_no text unique not null,
+            amount_cents integer not null,
+            status text not null,
+            request_json text not null default '{}',
+            response_json text not null default '{}',
+            created_at integer not null,
+            updated_at integer not null
+        );
+
+        create index if not exists idx_payment_transactions_order
+        on payment_transactions(order_id);
+        """
+    )
+    admin = con.execute("select id from users where email=?", (SHOP_ADMIN_EMAIL,)).fetchone()
+    if admin:
+        con.execute(
+            "update users set password_hash=?, role='admin' where email=?",
+            (hash_password(SHOP_ADMIN_PASSWORD), SHOP_ADMIN_EMAIL),
+        )
+    else:
+        con.execute(
+            "insert into users(email,password_hash,role,created_at) values(?,?,?,?)",
+            (SHOP_ADMIN_EMAIL, hash_password(SHOP_ADMIN_PASSWORD), "admin", now_ms()),
+        )
+    count = con.execute("select count(*) from users").fetchone()[0]
+    if SHOP_SEED_DEMO_USER and count == 1:
+        con.execute(
+            "insert into users(email,password_hash,role,created_at) values(?,?,?,?)",
+            ("user@example.com", hash_password("user123456"), "customer", now_ms()),
+        )
+    products = con.execute("select count(*) from products").fetchone()[0]
+    if products == 0:
+        seed = [
+            ("轻量月付", "monthly", 30, 80, 1900, 10),
+            ("标准月付", "monthly", 30, 220, 3900, 20),
+            ("大流量月付", "monthly", 30, 500, 6900, 30),
+            ("标准季度", "quarterly", 90, 720, 9900, 40),
+            ("大流量季度", "quarterly", 90, 1600, 18900, 50),
+            ("年度畅用", "yearly", 365, 3600, 59900, 60),
+        ]
+        for name, period, days, traffic, price, sort in seed:
+            con.execute(
+                """
+                insert into products(name,billing_period,duration_days,traffic_gb,price_cents,active,sort_order,created_at,updated_at)
+                values(?,?,?,?,?,1,?,?,?)
+                """,
+                (name, period, days, traffic, price, sort, now_ms(), now_ms()),
+            )
+    for provider in ("wechat", "alipay"):
+        exists = con.execute("select provider from payment_settings where provider=?", (provider,)).fetchone()
+        if not exists:
+            con.execute(
+                "insert into payment_settings(provider,enabled,config_json,created_at,updated_at) values(?,?,?,?,?)",
+                (provider, 0, "{}", now_ms(), now_ms()),
+            )
+    con.commit()
+    con.close()
+
+
+def sign(value):
+    sig = hmac.new(SESSION_SECRET.encode(), value.encode(), hashlib.sha256).hexdigest()
+    return f"{value}.{sig}"
+
+
+def unsign(value):
+    if not value or "." not in value:
+        return None
+    raw, sig = value.rsplit(".", 1)
+    good = hmac.new(SESSION_SECRET.encode(), raw.encode(), hashlib.sha256).hexdigest()
+    if hmac.compare_digest(sig, good):
+        return raw
+    return None
+
+
+def parse_form(body):
+    return {k: v[-1] for k, v in urllib.parse.parse_qs(body.decode(), keep_blank_values=True).items()}
+
+
+def decode_json(value):
+    try:
+        return json.loads(value or "{}")
+    except json.JSONDecodeError:
+        return {}
+
+
+PAYMENT_CONFIG_FIELDS = {
+    "wechat": {
+        "title": "微信支付",
+        "public": ("appid", "mch_id", "merchant_serial_no", "notify_url"),
+        "secret": ("api_v3_key", "private_key_pem", "platform_cert_pem"),
+    },
+    "alipay": {
+        "title": "支付宝",
+        "public": ("app_id", "gateway_url", "notify_url", "return_url", "sign_type"),
+        "secret": ("merchant_private_key", "alipay_public_key"),
+    },
+}
+
+
+def get_payment_setting(con, provider):
+    row = con.execute("select * from payment_settings where provider=?", (provider,)).fetchone()
+    if row:
+        return row
+    con.execute(
+        "insert into payment_settings(provider,enabled,config_json,created_at,updated_at) values(?,?,?,?,?)",
+        (provider, 0, "{}", now_ms(), now_ms()),
+    )
+    con.commit()
+    return con.execute("select * from payment_settings where provider=?", (provider,)).fetchone()
+
+
+def get_all_payment_settings(con):
+    return {provider: get_payment_setting(con, provider) for provider in PAYMENT_CONFIG_FIELDS}
+
+
+def update_payment_setting(con, provider, form):
+    fields = PAYMENT_CONFIG_FIELDS[provider]
+    old = decode_json(get_payment_setting(con, provider)["config_json"])
+    config = {}
+    for key in fields["public"]:
+        value = (form.get(key, "") or "").strip()
+        config[key] = value
+    for key in fields["secret"]:
+        value = form.get(key, "")
+        config[key] = value if value else old.get(key, "")
+    con.execute(
+        "update payment_settings set enabled=?, config_json=?, updated_at=? where provider=?",
+        (1 if form.get("enabled") == "on" else 0, json.dumps(config, ensure_ascii=False), now_ms(), provider),
+    )
+    con.commit()
+
+
+def payment_setting_ready(row):
+    if not row or not row["enabled"]:
+        return False
+    config = decode_json(row["config_json"])
+    if row["provider"] == "wechat":
+        required = ("appid", "mch_id", "api_v3_key", "merchant_serial_no", "private_key_pem")
+    elif row["provider"] == "alipay":
+        required = ("app_id", "merchant_private_key", "alipay_public_key")
+    else:
+        return False
+    return all((config.get(k) or "").strip() for k in required)
+
+
+def create_payment_transaction(con, order_id, provider, amount_cents):
+    prefix = "PWX" if provider == "wechat" else "PAL"
+    provider_order_no = prefix + time.strftime("%Y%m%d%H%M%S") + secrets.token_hex(4).upper()
+    now = now_ms()
+    con.execute(
+        """
+        insert into payment_transactions(order_id,provider,provider_order_no,amount_cents,status,request_json,response_json,created_at,updated_at)
+        values(?,?,?,?,?,?,?,?,?)
+        """,
+        (order_id, provider, provider_order_no, amount_cents, "created", "{}", "{}", now, now),
+    )
+    con.execute(
+        "update orders set payment_method=?, payment_ref=?, updated_at=? where id=?",
+        (provider, provider_order_no, now, order_id),
+    )
+    con.commit()
+    return {"id": con.execute("select last_insert_rowid()").fetchone()[0], "provider_order_no": provider_order_no}
+
+
+def token_digest(token):
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def create_password_reset_token(con, user_id):
+    token = secrets.token_urlsafe(32)
+    now = now_ms()
+    con.execute(
+        "update password_reset_tokens set used_at=? where user_id=? and used_at is null",
+        (now, user_id),
+    )
+    con.execute(
+        """
+        insert into password_reset_tokens(user_id,token_hash,expires_at,created_at)
+        values(?,?,?,?)
+        """,
+        (user_id, token_digest(token), now + PASSWORD_RESET_TTL_MS, now),
+    )
+    con.execute("delete from password_reset_tokens where expires_at < ? or used_at is not null", (now - PASSWORD_RESET_TTL_MS,))
+    con.commit()
+    return token
+
+
+def find_valid_password_reset_token(con, token):
+    if not token:
+        return None
+    return con.execute(
+        """
+        select t.*, u.email
+        from password_reset_tokens t
+        join users u on u.id=t.user_id
+        where t.token_hash=? and t.used_at is null and t.expires_at>=?
+        """,
+        (token_digest(token), now_ms()),
+    ).fetchone()
+
+
+def reset_password_with_token(token, new_password):
+    if len(new_password or "") < 8:
+        return False
+    con = get_db()
+    row = find_valid_password_reset_token(con, token)
+    if not row:
+        con.close()
+        return False
+    now = now_ms()
+    con.execute("update users set password_hash=? where id=?", (hash_password(new_password), row["user_id"]))
+    con.execute("update password_reset_tokens set used_at=? where id=?", (now, row["id"]))
+    con.commit()
+    con.close()
+    return True
+
+
+def send_password_reset_email(email, reset_url):
+    if not RESEND_API_KEY:
+        return False, "RESEND_API_KEY 未配置"
+    delivery_email = PASSWORD_RESET_OPERATOR_EMAIL or email
+    operator_mode = bool(PASSWORD_RESET_OPERATOR_EMAIL)
+    subject = "重置你的 Node1 登录密码"
+    heading = "Node1 账号安全通知"
+    intro = "你正在为 Node1 管理前端申请重置密码。为保护账号安全，这个链接 30 分钟内有效，且只能使用一次。"
+    security_note = "本邮件只用于本次密码找回。Node1 不会通过邮件索要你的密码、验证码或付款信息。"
+    text_intro = (
+        "你正在为 Node1 管理前端申请重置密码。请打开下面的链接设置新密码，"
+        "链接 30 分钟内有效且只能使用一次："
+    )
+    text_security_note = "本邮件只用于本次密码找回。Node1 不会通过邮件索要你的密码、验证码或付款信息。"
+    if operator_mode:
+        subject = f"Node1 用户密码重置请求：{email}"
+        heading = "用户密码重置请求"
+        intro = f"用户 {html.escape(email)} 申请重置 Node1 登录密码。请确认后把下面的一次性链接转交给该用户。"
+        security_note = "此链接只用于本次密码找回。转交前请确认申请人身份，避免泄露账号访问权。"
+        text_intro = f"用户 {email} 申请重置 Node1 登录密码。请确认后把下面的一次性链接转交给该用户："
+        text_security_note = "此链接只用于本次密码找回。转交前请确认申请人身份，避免泄露账号访问权。"
+    payload = {
+        "from": RESEND_FROM_EMAIL,
+        "to": [delivery_email],
+        "subject": subject,
+        "html": f"""
+        <div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;line-height:1.7;color:#172033;max-width:560px">
+          <p style="margin:0 0 12px;color:#667085;font-size:13px">Node1 Support · 账号安全邮件</p>
+          <h2 style="margin:0 0 16px;color:#101828">{heading}</h2>
+          <p>{intro}</p>
+          <p style="background:#f2f4f7;border-left:4px solid #667085;padding:10px 12px;color:#344054">{security_note}</p>
+          <p><a href="{html.escape(reset_url)}" style="display:inline-block;padding:10px 16px;background:#1f2937;color:#fff;text-decoration:none;border-radius:6px">设置新密码</a></p>
+          <p>如果按钮无法打开，请复制下面的链接到浏览器地址栏：</p>
+          <p style="word-break:break-all;color:#475467">{html.escape(reset_url)}</p>
+          <hr style="border:0;border-top:1px solid #eaecf0;margin:20px 0">
+          <p style="color:#667085;font-size:13px">如果不是你本人操作，可以忽略这封邮件。请不要把这封邮件或重置链接转发给他人。</p>
+          <p style="color:#667085;font-size:13px">发件域名：node1.talking202606.dpdns.org</p>
+        </div>
+        """,
+        "text": (
+            f"Node1 Support - 账号安全邮件\n\n"
+            f"{text_intro}\n{reset_url}\n\n"
+            f"{text_security_note}\n\n"
+            "如果不是你本人操作，可以忽略这封邮件。请不要把这封邮件或重置链接转发给他人。\n"
+            "发件域名：node1.talking202606.dpdns.org"
+        ),
+    }
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type": "application/json",
+            "User-Agent": "subscription-shop/1.0 (+https://node1.talking202606.dpdns.org)",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            if 200 <= resp.status < 300:
+                return True, body
+            return False, body
+    except urllib.error.HTTPError as exc:
+        return False, exc.read().decode("utf-8", errors="replace")
+    except urllib.error.URLError as exc:
+        return False, str(exc.reason)
+
+
+def current_user(handler):
+    jar = cookies.SimpleCookie(handler.headers.get("Cookie"))
+    morsel = jar.get("sid")
+    uid = unsign(morsel.value) if morsel else None
+    if not uid:
+        return None
+    con = get_db()
+    user = con.execute("select * from users where id=?", (uid,)).fetchone()
+    con.close()
+    return user
+
+
+def require_user(fn):
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        user = current_user(self)
+        if not user:
+            return self.redirect("/login")
+        self.user = user
+        return fn(self, *args, **kwargs)
+    return wrapper
+
+
+def require_admin(fn):
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        user = current_user(self)
+        if not user:
+            return self.redirect("/login")
+        if user["role"] != "admin":
+            return self.render("无权限", "<div class='notice danger'>需要管理员权限。</div>", 403)
+        self.user = user
+        return fn(self, *args, **kwargs)
+    return wrapper
+
+
+def run_ssh(command, timeout=30):
+    target = f"{XUI_SSH_USER}@{XUI_HOST}"
+    cmd = [
+        "ssh",
+        "-i",
+        XUI_SSH_KEY,
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "PasswordAuthentication=no",
+        "-o",
+        "StrictHostKeyChecking=no",
+        target,
+        command,
+    ]
+    return subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
+
+
+def provision_xui(email_label, sub_id, client_uuid, traffic_bytes, expires_at_ms):
+    if XUI_MODE == "mock":
+        return {"ok": True, "mode": "mock", "message": "Mock provisioned. Set XUI_MODE=ssh or local for real 3X-UI provisioning."}
+
+    script = f"""
+import json, sqlite3, time
+p={XUI_DB_PATH!r}
+inbound_id={XUI_INBOUND_ID}
+email={email_label!r}
+sub_id={sub_id!r}
+uuid={client_uuid!r}
+traffic={int(traffic_bytes)}
+expiry={int(expires_at_ms)}
+now=int(time.time()*1000)
+con=sqlite3.connect(p); con.row_factory=sqlite3.Row
+inb=con.execute('select settings from inbounds where id=?', (inbound_id,)).fetchone()
+if not inb:
+    raise SystemExit('inbound not found')
+settings=json.loads(inb['settings'])
+clients=settings.setdefault('clients', [])
+client={{
+  'comment':'',
+  'created_at':now,
+  'updated_at':now,
+  'email':email,
+  'enable':True,
+  'expiryTime':expiry,
+  'flow':'xtls-rprx-vision',
+  'id':uuid,
+  'limitIp':0,
+  'reset':0,
+  'subId':sub_id,
+  'tgId':0,
+  'totalGB':traffic
+}}
+for i,c in enumerate(clients):
+    if c.get('email') == email:
+        clients[i]=client
+        break
+else:
+    clients.append(client)
+con.execute('update inbounds set settings=? where id=?', (json.dumps(settings, ensure_ascii=False, indent=2), inbound_id))
+row=con.execute('select id from clients where email=?', (email,)).fetchone()
+if row:
+    con.execute('update clients set sub_id=?, uuid=?, flow=?, total_gb=?, expiry_time=?, enable=1, updated_at=? where email=?',
+                (sub_id, uuid, 'xtls-rprx-vision', traffic, expiry, now, email))
+    client_id=row['id']
+else:
+    con.execute('insert into clients(email,sub_id,uuid,flow,limit_ip,total_gb,expiry_time,enable,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?)',
+                (email, sub_id, uuid, 'xtls-rprx-vision', 0, traffic, expiry, 1, now, now))
+    client_id=con.execute('select last_insert_rowid()').fetchone()[0]
+con.execute('insert or ignore into client_inbounds(client_id,inbound_id,flow_override,created_at) values(?,?,?,?)',
+            (client_id, inbound_id, 'xtls-rprx-vision', now))
+ct=con.execute('select id from client_traffics where inbound_id=? and email=?', (inbound_id, email)).fetchone()
+if ct:
+    con.execute('update client_traffics set enable=1,total=?,expiry_time=? where inbound_id=? and email=?',
+                (traffic, expiry, inbound_id, email))
+else:
+    con.execute('insert into client_traffics(inbound_id,enable,email,up,down,expiry_time,total,reset,last_online) values(?,?,?,?,?,?,?,?,?)',
+                (inbound_id, 1, email, 0, 0, expiry, traffic, 0, 0))
+con.commit()
+print('OK')
+"""
+    if XUI_MODE == "local":
+        result = subprocess.run(["python3", "-c", script], text=True, capture_output=True, timeout=30)
+        if result.returncode == 0:
+            subprocess.run(["systemctl", "restart", "x-ui"], text=True, capture_output=True, timeout=20)
+            return {"ok": True, "mode": "local", "message": result.stdout.strip()}
+        return {"ok": False, "mode": "local", "message": result.stderr.strip() or result.stdout.strip()}
+    if XUI_MODE == "ssh":
+        remote = "python3 - <<'PY'\n" + script + "\nPY\nsystemctl restart x-ui\n"
+        result = run_ssh(remote, timeout=45)
+        if result.returncode == 0:
+            return {"ok": True, "mode": "ssh", "message": result.stdout.strip()}
+        return {"ok": False, "mode": "ssh", "message": result.stderr.strip() or result.stdout.strip()}
+    return {"ok": False, "mode": XUI_MODE, "message": "Unknown XUI_MODE"}
+
+
+class App(BaseHTTPRequestHandler):
+    routes = {}
+
+    def log_message(self, fmt, *args):
+        print("%s - %s" % (self.address_string(), fmt % args))
+
+    def send_html(self, status, body, headers=None):
+        data = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def redirect(self, path):
+        self.send_response(303)
+        self.send_header("Location", path)
+        self.end_headers()
+
+    def get_body(self):
+        length = int(self.headers.get("Content-Length", 0))
+        return self.rfile.read(length) if length else b""
+
+    def render(self, title, content, status=200):
+        user = current_user(self)
+        path = urllib.parse.urlparse(self.path).path
+        active = {
+            "dashboard": "active" if path in ("/", "/dashboard") else "",
+            "docs": "active" if path == "/docs" else "",
+            "plans": "active" if path.startswith("/plans") or path.startswith("/checkout") else "",
+            "orders": "active" if path.startswith("/orders") else "",
+            "invitations": "active" if path == "/invitations" else "",
+            "nodes": "active" if path == "/nodes" else "",
+            "tickets": "active" if path == "/tickets" else "",
+            "traffic": "active" if path == "/traffic" else "",
+            "profile": "active" if path in ("/profile", "/login", "/register", "/forgot-password", "/reset-password") else "",
+            "admin": "active" if path.startswith("/admin") else "",
+        }
+        if user:
+            admin = f"<a class='side-item {active['admin']}' href='/admin'><span class='side-icon icon-admin'></span><span>管理后台</span></a>" if user["role"] == "admin" else ""
+            account = html.escape(user["email"])
+            side = f"""
+            <a class="side-brand" href="/dashboard"><span class="brand-mark">N</span><span>Node1</span></a>
+            <nav class="side-menu" aria-label="主菜单">
+              <a class="side-item {active['dashboard']}" href="/dashboard"><span class="side-icon icon-home"></span><span>仪表盘</span></a>
+              <a class="side-item {active['docs']}" href="/docs"><span class="side-icon icon-doc"></span><span>使用文档</span></a>
+              <p class="side-group">财务</p>
+              <a class="side-item {active['orders']}" href="/dashboard#orders"><span class="side-icon icon-list"></span><span>我的订单</span></a>
+              <a class="side-item {active['invitations']}" href="/invitations"><span class="side-icon icon-invite"></span><span>我的邀请</span></a>
+              <p class="side-group">订阅</p>
+              <a class="side-item {active['plans']}" href="/plans"><span class="side-icon icon-bag"></span><span>购买订阅</span></a>
+              <a class="side-item {active['nodes']}" href="/nodes"><span class="side-icon icon-status"></span><span>节点状态</span></a>
+              <p class="side-group">用户</p>
+              <a class="side-item {active['profile']}" href="/profile"><span class="side-icon icon-user"></span><span>个人中心</span></a>
+              <a class="side-item {active['tickets']}" href="/tickets"><span class="side-icon icon-ticket"></span><span>我的工单</span></a>
+              <a class="side-item {active['traffic']}" href="/traffic"><span class="side-icon icon-traffic"></span><span>流量明细</span></a>
+              {admin}
+            </nav>
+            """
+        else:
+            account = "未登录"
+            side = f"""
+            <a class="side-brand" href="/plans"><span class="brand-mark">N</span><span>Node1</span></a>
+            <nav class="side-menu" aria-label="主菜单">
+              <a class="side-item {active['docs']}" href="/docs"><span class="side-icon icon-doc"></span><span>使用文档</span></a>
+              <a class="side-item {active['plans']}" href="/plans"><span class="side-icon icon-bag"></span><span>购买订阅</span></a>
+              <a class="side-item {active['profile']}" href="/login"><span class="side-icon icon-user"></span><span>登录</span></a>
+              <a class="side-item" href="/register"><span class="side-icon icon-doc"></span><span>注册</span></a>
+            </nav>
+            """
+        crumb = html.escape(title)
+        top_actions = "<a class='top-link' href='/logout'>退出</a>" if user else "<a class='top-link' href='/login'>登录</a>"
+        page = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{html.escape(title)} · 订阅商城</title>
+  <link rel="stylesheet" href="/static/style.css?v=fengqun-menu-20260625">
+</head>
+<body>
+  <div class="app-layout">
+    <aside class="sidebar">{side}</aside>
+    <section class="workspace">
+      <header class="topbar">
+        <div class="breadcrumb"><span class="menu-mark"></span><span>首页</span><span>/</span><b>{crumb}</b></div>
+        <div class="account-pill"><span class="avatar-dot"></span><span>{account}</span>{top_actions}</div>
+      </header>
+      <main class="shell">
+        {content}
+      </main>
+    </section>
+  </div>
+  <script>
+    document.addEventListener('click', async function (event) {{
+      const button = event.target.closest('[data-copy-value]');
+      if (!button || button.disabled) return;
+      const value = button.getAttribute('data-copy-value') || '';
+      if (!value) return;
+      try {{
+        await navigator.clipboard.writeText(value);
+        const oldText = button.textContent;
+        button.textContent = '已复制';
+        window.setTimeout(function () {{ button.textContent = oldText; }}, 1400);
+      }} catch (err) {{
+        button.textContent = '复制失败';
+      }}
+    }});
+  </script>
+</body>
+</html>"""
+        self.send_html(status, page)
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/static/style.css":
+            return self.static_css()
+        name = "get_index" if path == "/" else "get_" + path.strip("/").replace("/", "_").replace("-", "_")
+        handler = getattr(self, name, None)
+        if handler:
+            return handler()
+        if path.startswith("/admin/products/") and path.endswith("/edit"):
+            return self.get_admin_product_edit(path)
+        return self.render("未找到", "<div class='notice danger'>页面不存在。</div>", 404)
+
+    def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path
+        handler = getattr(self, "post_" + path.strip("/").replace("/", "_").replace("-", "_"), None)
+        if handler:
+            return handler()
+        if path.startswith("/admin/products/") and path.endswith("/edit"):
+            return self.post_admin_product_edit(path)
+        if path.startswith("/admin/orders/"):
+            return self.post_admin_order_action(path)
+        if path.startswith("/orders/") and path.endswith("/pay"):
+            return self.post_order_pay(path)
+        return self.render("未找到", "<div class='notice danger'>操作不存在。</div>", 404)
+
+    def static_css(self):
+        with open(os.path.join(APP_DIR, "static", "style.css"), "rb") as f:
+            data = f.read()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/css; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def get_index(self):
+        if current_user(self):
+            return self.get_dashboard()
+        return self.get_plans()
+
+    def get_docs(self):
+        content = """
+        <section class="page-title docs-title">
+          <div>
+            <h1>Node1 使用文档</h1>
+            <p class="muted">面向普通用户和站点运营方的服务说明。本文不会展示任何真实订阅密钥、节点 UUID 或后台地址。</p>
+          </div>
+        </section>
+        <section class="docs-grid">
+          <article class="n-card doc-card">
+            <div class="n-card-header"><h2>给用户：这个服务是什么</h2></div>
+            <div class="n-card-content doc-copy">
+              <p>Node1 是一个轻量订阅服务站。你购买套餐后，系统会为你的账户开通专属订阅，并在仪表盘提供两种入口：订阅链接和单节点链接。</p>
+              <ul>
+                <li>推荐方式：在 Clash / Mihomo 类客户端中使用 URL 导入订阅。</li>
+                <li>备用方式：复制单节点链接，手动添加到支持 VLESS REALITY 的客户端。</li>
+                <li>订阅和节点都属于个人凭据，不要发到公开群、论坛或截图里。</li>
+              </ul>
+            </div>
+          </article>
+          <article class="n-card doc-card">
+            <div class="n-card-header"><h2>用户流程</h2></div>
+            <div class="n-card-content doc-copy">
+              <ol>
+                <li>注册或登录账户。</li>
+                <li>进入“购买订阅”，选择适合自己的套餐。</li>
+                <li>完成订单后，等待系统或管理员开通。</li>
+                <li>回到“仪表盘”，在“捷径”里点击“一键拷贝订阅”。</li>
+                <li>打开 Windows 或 Android 上的 Clash / Mihomo 类应用，通过 URL 导入。</li>
+              </ol>
+              <p>如果客户端不支持订阅导入，可以使用“一键拷贝节点”。优先使用订阅导入，因为以后更新节点参数时更省心。</p>
+            </div>
+          </article>
+          <article class="n-card doc-card">
+            <div class="n-card-header"><h2>密码和账户安全</h2></div>
+            <div class="n-card-content doc-copy">
+              <ul>
+                <li>忘记密码时，进入“账户安全”或“找回密码”，使用注册邮箱接收重置邮件。</li>
+                <li>重置链接有时效，并且只能使用一次。</li>
+                <li>如果怀疑订阅泄漏，请联系管理员处理，不要继续把旧链接发给别人测试。</li>
+                <li>客服沟通时尽量只提供注册邮箱和订单号，不要反复发送完整订阅链接。</li>
+              </ul>
+            </div>
+          </article>
+          <article class="n-card doc-card">
+            <div class="n-card-header"><h2>给运营方：订单和开通</h2></div>
+            <div class="n-card-content doc-copy">
+              <ul>
+                <li>pending_payment：用户已创建订单，等待付款或确认。</li>
+                <li>paid：已确认收款，等待开通。</li>
+                <li>provisioned：已开通，用户可以在仪表盘复制订阅或节点。</li>
+                <li>provision_failed：开通失败，需要检查 x-ui、节点参数或服务器状态后重试。</li>
+              </ul>
+              <p>处理用户问题时，优先核对订单状态、订阅到期时间、套餐流量和邮箱归属。不要在聊天记录里长期保留完整节点链接。</p>
+            </div>
+          </article>
+          <article class="n-card doc-card">
+            <div class="n-card-header"><h2>隐私边界</h2></div>
+            <div class="n-card-content doc-copy">
+              <p>站点只应展示用户自己的订阅状态、订单和复制入口。页面和文档不公开后台路径、服务器密钥、数据库位置、真实私钥或其他用户信息。</p>
+              <p>如果需要协助排障，可以让用户描述客户端、系统、报错和大致时间；只有在必要时再让用户私下提供订阅信息，并在处理后尽快清理。</p>
+            </div>
+          </article>
+          <article class="n-card doc-card">
+            <div class="n-card-header"><h2>常见问题</h2></div>
+            <div class="n-card-content doc-copy">
+              <dl class="faq-list">
+                <dt>URL 导入失败怎么办？</dt>
+                <dd>先确认复制的是“订阅”而不是“节点”，再检查客户端是否支持 Clash / Mihomo 订阅。</dd>
+                <dt>节点能给朋友用吗？</dt>
+                <dd>可以分发给指定朋友，但不要公开传播。多人长期共用可能影响稳定性和隐私。</dd>
+                <dt>到期后会怎样？</dt>
+                <dd>套餐到期后订阅会停止可用，需要重新购买或续费。</dd>
+              </dl>
+            </div>
+          </article>
+        </section>
+        """
+        return self.render("使用文档", content)
+
+    def get_plans(self):
+        con = get_db()
+        products = con.execute("select * from products where active=1 order by sort_order,id").fetchall()
+        con.close()
+        cards = []
+        for p in products:
+            duration = duration_label(p["duration_days"])
+            traffic = gb_label(p["traffic_gb"])
+            badge = "推荐" if p["duration_days"] >= 90 or p["traffic_gb"] >= 500 else "入门"
+            plan_tone = "featured" if p["duration_days"] >= 90 or p["traffic_gb"] >= 500 else "standard"
+            cards.append(f"""
+            <article class="plan {plan_tone}">
+              <div class="plan-ribbon"></div>
+              <div class="plan-head">
+                <div>
+                  <span class="plan-badge">{badge}</span>
+                  <h2>{html.escape(p['name'])}</h2>
+                </div>
+                <p class="plan-price"><b>{money(p['price_cents'])}</b><span>/{duration}</span></p>
+              </div>
+              <div class="plan-body">
+                <div class="plan-feature-grid">
+                  <div><b>{traffic}</b><span>可用流量</span></div>
+                  <div><b>{p['duration_days']} 天</b><span>有效期</span></div>
+                  <div><b>URL</b><span>订阅导入</span></div>
+                </div>
+                <ul class="plan-benefits">
+                  <li>开通后仪表盘复制订阅或节点</li>
+                  <li>到期自动停止，减少误用风险</li>
+                  <li>支持 Windows / Android Clash 类应用</li>
+                </ul>
+              </div>
+              <form method="post" action="/orders" class="plan-cta">
+                <input type="hidden" name="product_id" value="{p['id']}">
+                <button type="submit">立即订阅</button>
+              </form>
+            </article>
+            """)
+        content = f"""
+        <section class="page-title">
+          <h1>选择最适合您的计划</h1>
+          <div class="radio-tabs"><span class="active">全部</span><span>按周期</span><span>按流量</span></div>
+        </section>
+        <section class="grid plans">{''.join(cards)}</section>
+        """
+        return self.render("套餐", content)
+
+    def get_register(self):
+        return self.render("注册", form_page("注册", "/register", include_name=False, button="创建账户"))
+
+    def post_register(self):
+        form = parse_form(self.get_body())
+        email = form.get("email", "").strip().lower()
+        password = form.get("password", "")
+        if "@" not in email or len(password) < 8:
+            return self.render("注册", "<div class='notice danger'>邮箱或密码不符合要求，密码至少 8 位。</div>" + form_page("注册", "/register", button="创建账户"), 400)
+        con = get_db()
+        try:
+            con.execute("insert into users(email,password_hash,role,created_at) values(?,?,?,?)", (email, hash_password(password), "customer", now_ms()))
+            con.commit()
+        except sqlite3.IntegrityError:
+            con.close()
+            return self.render("注册", "<div class='notice danger'>邮箱已存在。</div>" + form_page("注册", "/register", button="创建账户"), 400)
+        uid = con.execute("select id from users where email=?", (email,)).fetchone()[0]
+        con.close()
+        self.set_session(uid)
+        return self.redirect("/dashboard")
+
+    def get_login(self):
+        return self.render("登录", login_page())
+
+    def post_login(self):
+        form = parse_form(self.get_body())
+        email = form.get("email", "").strip().lower()
+        password = form.get("password", "")
+        con = get_db()
+        user = con.execute("select * from users where email=?", (email,)).fetchone()
+        con.close()
+        if not user or not verify_password(password, user["password_hash"]):
+            return self.render("登录", "<div class='notice danger'>邮箱或密码错误。</div>" + login_page(), 401)
+        self.set_session(user["id"])
+        return self.redirect("/dashboard")
+
+    def get_forgot_password(self):
+        return self.render("找回密码", forgot_password_page())
+
+    def post_forgot_password(self):
+        form = parse_form(self.get_body())
+        email = form.get("email", "").strip().lower()
+        if PASSWORD_RESET_OPERATOR_EMAIL:
+            generic_notice = "<div class='notice'>如果这个邮箱已注册，系统会通知管理员处理密码重置请求。</div>"
+        else:
+            generic_notice = "<div class='notice'>如果这个邮箱已注册，系统会发送一封密码重置邮件。请检查收件箱和垃圾邮件。</div>"
+        if "@" not in email:
+            return self.render("找回密码", generic_notice + forgot_password_page())
+        con = get_db()
+        user = con.execute("select id,email from users where email=?", (email,)).fetchone()
+        if not user:
+            con.close()
+            return self.render("找回密码", generic_notice + forgot_password_page())
+        token = create_password_reset_token(con, user["id"])
+        con.close()
+        reset_url = PUBLIC_SUB_BASE.rstrip("/") + "/reset-password?" + urllib.parse.urlencode({"token": token})
+        ok, message = send_password_reset_email(user["email"], reset_url)
+        if not ok:
+            print(f"password reset email failed for user_id={user['id']}: {message}")
+            return self.render(
+                "找回密码",
+                "<div class='notice danger'>邮件服务暂时不可用，请稍后重试或联系管理员。</div>" + forgot_password_page(),
+                200,
+            )
+        return self.render("找回密码", generic_notice + forgot_password_page())
+
+    def get_reset_password(self):
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        token = qs.get("token", [""])[0]
+        con = get_db()
+        row = find_valid_password_reset_token(con, token)
+        con.close()
+        if not row:
+            return self.render("重置密码", "<div class='notice danger'>重置链接无效或已过期，请重新申请。</div>" + forgot_password_page(), 400)
+        return self.render("重置密码", reset_password_page(token, row["email"]))
+
+    def post_reset_password(self):
+        form = parse_form(self.get_body())
+        token = form.get("token", "")
+        password = form.get("password", "")
+        password_confirm = form.get("password_confirm", "")
+        if len(password) < 8 or password != password_confirm:
+            return self.render("重置密码", "<div class='notice danger'>两次输入的密码不一致，且密码至少 8 位。</div>" + reset_password_page(token), 400)
+        if not reset_password_with_token(token, password):
+            return self.render("重置密码", "<div class='notice danger'>重置链接无效或已过期，请重新申请。</div>" + forgot_password_page(), 400)
+        return self.render("重置完成", "<div class='notice'>密码已重置，请使用新密码登录。</div>" + login_page())
+
+    def post_payment_wechat_notify(self):
+        self.get_body()
+        data = b'{"code":"SUCCESS","message":"accepted"}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def post_payment_alipay_notify(self):
+        self.get_body()
+        data = b"success"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def set_session(self, uid):
+        self.send_response(303)
+        self.send_header("Location", "/dashboard")
+        self.send_header("Set-Cookie", f"sid={sign(str(uid))}; HttpOnly; SameSite=Lax; Path=/")
+        self.end_headers()
+
+    def get_logout(self):
+        self.send_response(303)
+        self.send_header("Location", "/plans")
+        self.send_header("Set-Cookie", "sid=; Max-Age=0; Path=/")
+        self.end_headers()
+
+    @require_user
+    def get_dashboard(self):
+        con = get_db()
+        orders = con.execute(
+            """
+            select o.*, p.name product_name, p.traffic_gb, p.duration_days
+            from orders o join products p on p.id=o.product_id
+            where o.user_id=? order by o.id desc
+            """,
+            (self.user["id"],),
+        ).fetchall()
+        subs = con.execute(
+            "select * from subscriptions where user_id=? order by id desc", (self.user["id"],)
+        ).fetchall()
+        con.close()
+        order_rows = "".join(order_row(o, customer=True) for o in orders) or "<tr><td colspan='5'>暂无订单</td></tr>"
+        latest_sub = subs[0] if subs else None
+        sub_card = subscription_card(latest_sub) if latest_sub else empty_subscription_card()
+        shortcut_card = shortcut_panel(latest_sub)
+        content = f"""
+        <section class="notice-card">
+          <span>公告</span>
+          <h1>Node1 订阅服务</h1>
+          <p>当前站点用于分发你的专属节点和订阅链接。请勿公开转发订阅地址；发现泄漏后请联系管理员处理。</p>
+        </section>
+        <section id="subscription" class="n-card subscription-panel">
+          <div class="n-card-header"><h2>我的订阅</h2></div>
+          <div class="n-card-content">{sub_card}</div>
+        </section>
+        {shortcut_card}
+        <section id="orders" class="n-card">
+          <div class="n-card-header"><h2>我的订单</h2></div>
+          <div class="n-card-content table-wrap">
+            <table><thead><tr><th>订单</th><th>套餐</th><th>金额</th><th>状态</th><th>操作</th></tr></thead><tbody>{order_rows}</tbody></table>
+          </div>
+        </section>
+        """
+        return self.render("用户中心", content)
+
+    @require_user
+    def get_profile(self):
+        email = html.escape(self.user["email"])
+        role = "管理员" if self.user["role"] == "admin" else "普通用户"
+        content = f"""
+        <section class="page-title compact-page-title">
+          <div>
+            <h1>个人中心</h1>
+            <p class="muted">查看账户资料和安全入口。站点不会在页面中明文展示密码、节点 UUID 或订阅密钥。</p>
+          </div>
+        </section>
+        <section class="profile-grid">
+          <article class="n-card">
+            <div class="n-card-header"><h2>账户信息</h2></div>
+            <div class="n-card-content">
+              <dl class="kv">
+                <dt>邮箱</dt><dd>{email}</dd>
+                <dt>身份</dt><dd>{role}</dd>
+                <dt>状态</dt><dd><span class="status-pill ok">正常</span></dd>
+              </dl>
+            </div>
+          </article>
+          <article class="n-card">
+            <div class="n-card-header"><h2>账户安全</h2></div>
+            <div class="n-card-content profile-action-card">
+              <p class="muted">如忘记密码，可通过已绑定邮箱发起重置。请勿把订阅链接或单节点链接公开转发。</p>
+              <a class="button" href="/forgot-password">重置密码</a>
+            </div>
+          </article>
+        </section>
+        """
+        return self.render("个人中心", content)
+
+    @require_user
+    def get_invitations(self):
+        content = """
+        <section class="page-title compact-page-title">
+          <div>
+            <h1>我的邀请</h1>
+            <p class="muted">邀请关系会涉及用户身份和订阅权益，当前站点暂不公开展示任何用户关系数据。</p>
+          </div>
+        </section>
+        <section class="n-card">
+          <div class="n-card-header"><h2>邀请记录</h2></div>
+          <div class="n-card-content">
+            <div class="empty-card">
+              <b>邀请功能暂未开放</b>
+              <p>这里先保留和 fengqun.io 一致的入口。正式启用前，不会记录、展示或导出被邀请人的邮箱、订阅链接和个人资料。</p>
+            </div>
+          </div>
+        </section>
+        """
+        return self.render("我的邀请", content)
+
+    @require_user
+    def get_nodes(self):
+        content = """
+        <section class="page-title compact-page-title">
+          <div>
+            <h1>节点状态</h1>
+            <p class="muted">仅展示用户需要了解的连接信息，不暴露后台地址、入站配置或私密凭据。</p>
+          </div>
+        </section>
+        <section class="n-card">
+          <div class="n-card-header"><h2>可用节点</h2></div>
+          <div class="n-card-content table-wrap">
+            <table class="compact-table">
+              <thead><tr><th>节点</th><th>状态</th><th>协议</th><th>倍率</th><th>说明</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td>Node1 Direct</td>
+                  <td><span class="status-pill ok">可用</span></td>
+                  <td>VLESS / REALITY</td>
+                  <td>1.00 x</td>
+                  <td>主节点</td>
+                </tr>
+              </tbody>
+            </table>
+            <p class="table-note muted">具体订阅地址请在“仪表盘”的捷径中复制，不建议截图或转发给他人。</p>
+          </div>
+        </section>
+        """
+        return self.render("节点状态", content)
+
+    @require_user
+    def get_tickets(self):
+        content = """
+        <section class="page-title compact-page-title">
+          <div>
+            <h1>我的工单</h1>
+            <p class="muted">用于承接账号、支付、订阅、节点连接等问题。当前先提供入口和空状态。</p>
+          </div>
+        </section>
+        <section class="n-card">
+          <div class="n-card-header"><h2>工单列表</h2></div>
+          <div class="n-card-content">
+            <div class="empty-card">
+              <b>暂无工单</b>
+              <p>工单系统尚未启用。遇到付款未开通、订阅泄漏、密码找回失败等问题，请联系站点管理员处理。</p>
+            </div>
+          </div>
+        </section>
+        """
+        return self.render("我的工单", content)
+
+    @require_user
+    def get_traffic(self):
+        con = get_db()
+        subs = con.execute(
+            "select * from subscriptions where user_id=? order by id desc", (self.user["id"],)
+        ).fetchall()
+        con.close()
+        rows = []
+        for s in subs:
+            rows.append(
+                "<tr>"
+                f"<td>{html.escape(s['email_label'])}</td>"
+                f"<td>{gb_label(s['traffic_bytes'] / 1024**3)}</td>"
+                "<td>暂未统计</td>"
+                f"<td>{ms_to_date(s['expires_at'])}</td>"
+                f"<td><span class='status-pill neutral'>{html.escape(s['xui_status'])}</span></td>"
+                "</tr>"
+            )
+        body = "".join(rows) or "<tr><td colspan='5'>暂无流量明细</td></tr>"
+        content = f"""
+        <section class="page-title compact-page-title">
+          <div>
+            <h1>流量明细</h1>
+            <p class="muted">展示当前账户已开通订阅的总量和到期状态。逐日上下行统计启用前不会伪造使用量。</p>
+          </div>
+        </section>
+        <section class="n-card">
+          <div class="n-card-header"><h2>订阅用量</h2></div>
+          <div class="n-card-content table-wrap">
+            <table class="compact-table">
+              <thead><tr><th>订阅标识</th><th>套餐总量</th><th>已用流量</th><th>到期时间</th><th>开通状态</th></tr></thead>
+              <tbody>{body}</tbody>
+            </table>
+            <p class="table-note muted">当前系统只保存套餐总流量和订阅到期时间；上线真实用量采集后，这里会显示每日明细。</p>
+          </div>
+        </section>
+        """
+        return self.render("流量明细", content)
+
+    @require_user
+    def post_orders(self):
+        form = parse_form(self.get_body())
+        product_id = int(form.get("product_id", "0") or 0)
+        con = get_db()
+        product = con.execute("select * from products where id=? and active=1", (product_id,)).fetchone()
+        if not product:
+            con.close()
+            return self.render("下单失败", "<div class='notice danger'>套餐不存在或已下架。</div>", 400)
+        order_no = "O" + time.strftime("%Y%m%d") + secrets.token_hex(4).upper()
+        con.execute(
+            "insert into orders(order_no,user_id,product_id,amount_cents,status,payment_method,created_at,updated_at) values(?,?,?,?,?,?,?,?)",
+            (order_no, self.user["id"], product_id, product["price_cents"], "pending_payment", "manual", now_ms(), now_ms()),
+        )
+        con.commit()
+        order_id = con.execute("select last_insert_rowid()").fetchone()[0]
+        con.close()
+        return self.redirect(f"/checkout?id={order_id}")
+
+    @require_user
+    def get_checkout(self):
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        order_id = int(qs.get("id", ["0"])[0])
+        con = get_db()
+        order = con.execute(
+            """
+            select o.*, p.name product_name, p.traffic_gb, p.duration_days
+            from orders o join products p on p.id=o.product_id
+            where o.id=? and o.user_id=?
+            """,
+            (order_id, self.user["id"]),
+        ).fetchone()
+        if not order:
+            con.close()
+            return self.render("订单不存在", "<div class='notice danger'>订单不存在。</div>", 404)
+        settings = get_all_payment_settings(con)
+        enabled_methods = [p for p, row in settings.items() if payment_setting_ready(row)]
+        con.close()
+        content = f"""
+        <section class="panel narrow">
+          <h1>确认订单</h1>
+          <dl class="kv">
+            <dt>订单号</dt><dd>{html.escape(order['order_no'])}</dd>
+            <dt>套餐</dt><dd>{html.escape(order['product_name'])} · {gb_label(order['traffic_gb'])} · {order['duration_days']} 天</dd>
+            <dt>金额</dt><dd>{money(order['amount_cents'])}</dd>
+            <dt>支付</dt><dd>请选择支付方式。自动回调接通前，付款完成后仍由后台确认收款并开通。</dd>
+          </dl>
+          <form method="post" action="/orders/{order['id']}/pay" class="form">
+            {payment_method_choices(enabled_methods)}
+            <button type="submit">继续支付</button>
+          </form>
+        </section>
+        """
+        return self.render("确认订单", content)
+
+    @require_user
+    def post_order_pay(self, path):
+        order_id = int(path.split("/")[2])
+        form = parse_form(self.get_body())
+        payment_method = form.get("payment_method", "manual")
+        con = get_db()
+        order = con.execute(
+            """
+            select o.*, p.name product_name
+            from orders o join products p on p.id=o.product_id
+            where o.id=? and o.user_id=?
+            """,
+            (order_id, self.user["id"]),
+        ).fetchone()
+        if not order:
+            con.close()
+            return self.render("订单不存在", "<div class='notice danger'>订单不存在。</div>", 404)
+        if payment_method in PAYMENT_CONFIG_FIELDS:
+            setting = get_payment_setting(con, payment_method)
+            if not payment_setting_ready(setting):
+                con.close()
+                return self.render("支付不可用", "<div class='notice danger'>该支付方式尚未配置完整，请选择其他支付方式。</div>", 400)
+            tx = create_payment_transaction(con, order_id, payment_method, order["amount_cents"])
+            con.close()
+            return self.render("支付订单", payment_pending_page(order, payment_method, tx))
+        if payment_method == "manual" and order["status"] == "pending_payment":
+            con.execute(
+                "update orders set status='paid',payment_ref=?,paid_at=?,updated_at=? where id=?",
+                ("mock-" + secrets.token_hex(6), now_ms(), now_ms(), order_id),
+            )
+            con.commit()
+            con.close()
+            provision_order(order_id)
+            return self.redirect("/dashboard")
+        con.close()
+        return self.redirect("/dashboard")
+
+    @require_admin
+    def get_admin(self):
+        con = get_db()
+        stats = {
+            "products": con.execute("select count(*) from products").fetchone()[0],
+            "orders": con.execute("select count(*) from orders").fetchone()[0],
+            "subs": con.execute("select count(*) from subscriptions").fetchone()[0],
+            "users": con.execute("select count(*) from users").fetchone()[0],
+        }
+        orders = con.execute(
+            """
+            select o.*, u.email user_email, p.name product_name
+            from orders o join users u on u.id=o.user_id join products p on p.id=o.product_id
+            order by o.id desc limit 8
+            """
+        ).fetchall()
+        con.close()
+        cards = "".join(f"<div class='metric'><b>{v}</b><span>{k}</span></div>" for k, v in stats.items())
+        rows = "".join(order_row(o, admin=True) for o in orders) or "<tr><td colspan='6'>暂无订单</td></tr>"
+        content = f"""
+        <section class="hero compact"><h1>管理后台</h1><p>上货、改价、处理订单和订阅开通。</p></section>
+        <section class="metrics">{cards}</section>
+        <div class="actions"><a class="button" href="/admin/products">商品管理</a><a class="button secondary" href="/admin/orders">订单管理</a><a class="button secondary" href="/admin/payments">支付配置</a></div>
+        <h2>最近订单</h2><table><thead><tr><th>订单</th><th>用户</th><th>商品</th><th>金额</th><th>状态</th><th>操作</th></tr></thead><tbody>{rows}</tbody></table>
+        """
+        return self.render("管理后台", content)
+
+    def admin_payments_content(self, notice=""):
+        con = get_db()
+        settings = get_all_payment_settings(con)
+        con.close()
+        return f"""
+        {notice}
+        <section class="hero compact"><h1>支付配置</h1><p>配置微信支付和支付宝。保存后，用户确认订单页会显示已启用且资料完整的支付方式。</p></section>
+        <section class="payment-layout">
+          {payment_config_panel('wechat', settings['wechat'])}
+          {payment_config_panel('alipay', settings['alipay'])}
+        </section>
+        <section class="panel">
+          <h2>前台交互流程</h2>
+          <div class="flow">
+            <div><b>1</b><span>用户确认订单</span></div>
+            <div><b>2</b><span>选择微信或支付宝</span></div>
+            <div><b>3</b><span>系统创建支付意向</span></div>
+            <div><b>4</b><span>后台确认回款并开通</span></div>
+          </div>
+          <p class="muted">真实自动回调需要商户平台开通产品、配置证书/密钥，并完成回调验签。当前页面已预留回调地址和支付交易记录。</p>
+        </section>
+        """
+
+    @require_admin
+    def get_admin_payments(self):
+        return self.render("支付配置", self.admin_payments_content())
+
+    @require_admin
+    def post_admin_payments(self):
+        form = parse_form(self.get_body())
+        provider = form.get("provider", "")
+        if provider not in PAYMENT_CONFIG_FIELDS:
+            return self.render("支付配置", "<div class='notice danger'>支付渠道不存在。</div>", 400)
+        con = get_db()
+        update_payment_setting(con, provider, form)
+        con.close()
+        return self.render("支付配置", self.admin_payments_content("<div class='notice'>支付配置已保存。</div>"))
+
+    @require_admin
+    def get_admin_products(self):
+        con = get_db()
+        products = con.execute("select * from products order by sort_order,id").fetchall()
+        con.close()
+        rows = "".join(product_row(p) for p in products)
+        content = f"""
+        <section class="hero compact"><h1>商品管理</h1><p>设置月付、季度、包年以及不同流量和价格。</p></section>
+        <section class="panel">
+          <h2>新增商品</h2>
+          {product_form('/admin/products')}
+        </section>
+        <table><thead><tr><th>名称</th><th>周期</th><th>流量</th><th>价格</th><th>状态</th><th>操作</th></tr></thead><tbody>{rows}</tbody></table>
+        """
+        return self.render("商品管理", content)
+
+    @require_admin
+    def post_admin_products(self):
+        form = parse_form(self.get_body())
+        con = get_db()
+        con.execute(
+            """
+            insert into products(name,billing_period,duration_days,traffic_gb,price_cents,active,sort_order,created_at,updated_at)
+            values(?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                form.get("name", "").strip(),
+                form.get("billing_period", "monthly"),
+                int(form.get("duration_days", "30")),
+                int(form.get("traffic_gb", "100")),
+                int(float(form.get("price_yuan", "0")) * 100),
+                1 if form.get("active") == "on" else 0,
+                int(form.get("sort_order", "100")),
+                now_ms(),
+                now_ms(),
+            ),
+        )
+        con.commit()
+        con.close()
+        return self.redirect("/admin/products")
+
+    @require_admin
+    def get_admin_product_edit(self, path):
+        product_id = int(path.split("/")[3])
+        con = get_db()
+        product = con.execute("select * from products where id=?", (product_id,)).fetchone()
+        con.close()
+        if not product:
+            return self.render("商品不存在", "<div class='notice danger'>商品不存在。</div>", 404)
+        return self.render("编辑商品", f"<section class='panel'>{product_form(f'/admin/products/{product_id}/edit', product)}</section>")
+
+    @require_admin
+    def post_admin_product_edit(self, path):
+        product_id = int(path.split("/")[3])
+        form = parse_form(self.get_body())
+        con = get_db()
+        con.execute(
+            """
+            update products
+            set name=?, billing_period=?, duration_days=?, traffic_gb=?, price_cents=?, active=?, sort_order=?, updated_at=?
+            where id=?
+            """,
+            (
+                form.get("name", "").strip(),
+                form.get("billing_period", "monthly"),
+                int(form.get("duration_days", "30")),
+                int(form.get("traffic_gb", "100")),
+                int(float(form.get("price_yuan", "0")) * 100),
+                1 if form.get("active") == "on" else 0,
+                int(form.get("sort_order", "100")),
+                now_ms(),
+                product_id,
+            ),
+        )
+        con.commit()
+        con.close()
+        return self.redirect("/admin/products")
+
+    @require_admin
+    def get_admin_orders(self):
+        con = get_db()
+        orders = con.execute(
+            """
+            select o.*, u.email user_email, p.name product_name
+            from orders o join users u on u.id=o.user_id join products p on p.id=o.product_id
+            order by o.id desc
+            """
+        ).fetchall()
+        con.close()
+        rows = "".join(order_row(o, admin=True) for o in orders) or "<tr><td colspan='6'>暂无订单</td></tr>"
+        return self.render("订单管理", f"<section class='hero compact'><h1>订单管理</h1></section><table><thead><tr><th>订单</th><th>用户</th><th>商品</th><th>金额</th><th>状态</th><th>操作</th></tr></thead><tbody>{rows}</tbody></table>")
+
+    @require_admin
+    def post_admin_order_action(self, path):
+        parts = path.strip("/").split("/")
+        order_id = int(parts[2])
+        action = parts[3]
+        con = get_db()
+        if action == "mark-paid":
+            con.execute("update orders set status='paid',payment_ref=?,paid_at=?,updated_at=? where id=? and status='pending_payment'", ("manual-" + secrets.token_hex(5), now_ms(), now_ms(), order_id))
+            con.commit()
+        con.close()
+        if action in ("mark-paid", "provision"):
+            provision_order(order_id)
+        return self.redirect("/admin/orders")
+
+
+def provision_order(order_id):
+    con = get_db()
+    order = con.execute(
+        """
+        select o.*, u.email user_email, p.name product_name, p.duration_days, p.traffic_gb
+        from orders o join users u on u.id=o.user_id join products p on p.id=o.product_id
+        where o.id=?
+        """,
+        (order_id,),
+    ).fetchone()
+    if not order or order["status"] not in ("paid", "provision_failed"):
+        con.close()
+        return
+    existing = con.execute("select id from subscriptions where order_id=?", (order_id,)).fetchone()
+    if existing:
+        con.execute("update orders set status='provisioned',provisioned_at=coalesce(provisioned_at,?),updated_at=? where id=?", (now_ms(), now_ms(), order_id))
+        con.commit()
+        con.close()
+        return
+    client_uuid = str(uuid.uuid4())
+    sub_id = "u" + secrets.token_urlsafe(8).replace("-", "").replace("_", "")
+    label = "user-" + str(order["user_id"]) + "-" + sub_id
+    traffic_bytes = int(order["traffic_gb"]) * 1024**3
+    expires_at = now_ms() + int(order["duration_days"]) * 86400 * 1000
+    result = provision_xui(label, sub_id, client_uuid, traffic_bytes, expires_at)
+    clash_url = f"{PUBLIC_SUB_BASE}/clashx/{sub_id}"
+    universal_url = f"{PUBLIC_SUB_BASE}/sub/{sub_id}"
+    if result["ok"]:
+        con.execute(
+            """
+            insert into subscriptions(user_id,order_id,product_id,email_label,sub_id,uuid,traffic_bytes,expires_at,clash_url,universal_url,xui_status,xui_message,created_at)
+            values(?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (order["user_id"], order_id, order["product_id"], label, sub_id, client_uuid, traffic_bytes, expires_at, clash_url, universal_url, result["mode"], result["message"], now_ms()),
+        )
+        con.execute("update orders set status='provisioned',provisioned_at=?,updated_at=? where id=?", (now_ms(), now_ms(), order_id))
+    else:
+        con.execute("update orders set status='provision_failed',updated_at=? where id=?", (now_ms(), order_id))
+    con.commit()
+    con.close()
+
+
+def form_page(title, action, include_name=False, button="提交"):
+    helper = "请使用已创建的账户登录。管理员初始账号由服务器环境变量配置。"
+    return f"""
+    <section class="panel narrow">
+      <h1>{title}</h1>
+      <form method="post" action="{action}" class="form">
+        <label>账号/邮箱<input name="email" required></label>
+        <label>密码<input name="password" type="password" minlength="8" required></label>
+        <button type="submit">{button}</button>
+      </form>
+      <p class="muted">{helper}</p>
+    </section>
+    """
+
+
+def login_page():
+    return """
+    <section class="panel narrow">
+      <h1>登录</h1>
+      <form method="post" action="/login" class="form">
+        <label>账号/邮箱<input name="email" required></label>
+        <label>密码<input name="password" type="password" minlength="8" required></label>
+        <button type="submit">登录</button>
+      </form>
+      <p class="muted">忘记密码？<a href="/forgot-password">通过邮箱找回</a></p>
+    </section>
+    """
+
+
+def forgot_password_page():
+    return """
+    <section class="panel narrow">
+      <h1>找回密码</h1>
+      <form method="post" action="/forgot-password" class="form">
+        <label>注册邮箱<input name="email" type="email" required></label>
+        <button type="submit">发送重置邮件</button>
+      </form>
+      <p class="muted">重置链接 30 分钟内有效，只能使用一次。</p>
+    </section>
+    """
+
+
+def reset_password_page(token, email=""):
+    account = f"<p class='muted'>正在重置：{html.escape(email)}</p>" if email else ""
+    return f"""
+    <section class="panel narrow">
+      <h1>重置密码</h1>
+      {account}
+      <form method="post" action="/reset-password" class="form">
+        <input type="hidden" name="token" value="{html.escape(token)}">
+        <label>新密码<input name="password" type="password" minlength="8" required></label>
+        <label>确认新密码<input name="password_confirm" type="password" minlength="8" required></label>
+        <button type="submit">保存新密码</button>
+      </form>
+    </section>
+    """
+
+
+def mask_saved(value):
+    return "已保存，留空则不修改" if value else "未填写"
+
+
+def input_text(name, label, value="", input_type="text", placeholder=""):
+    return f"""<label>{label}<input name="{name}" type="{input_type}" value="{html.escape(str(value or ''))}" placeholder="{html.escape(placeholder)}"></label>"""
+
+
+def textarea_field(name, label, value="", secret=False):
+    if secret:
+        return f"""<label>{label}<textarea name="{name}" rows="5" placeholder="{html.escape(mask_saved(value))}"></textarea></label>"""
+    return f"""<label>{label}<textarea name="{name}" rows="5">{html.escape(str(value or ''))}</textarea></label>"""
+
+
+def payment_config_panel(provider, row):
+    config = decode_json(row["config_json"])
+    enabled = "checked" if row["enabled"] else ""
+    ready = payment_setting_ready(row)
+    badge_text = "已启用" if ready else ("资料不完整" if row["enabled"] else "未启用")
+    badge_class = "badge ok" if ready else "badge"
+    if provider == "wechat":
+        title = "微信支付"
+        callback_url = PUBLIC_SUB_BASE.rstrip("/") + "/payment/wechat/notify"
+        fields = f"""
+          {input_text('appid', '公众号/小程序/AppID', config.get('appid', ''))}
+          {input_text('mch_id', '商户号 mch_id', config.get('mch_id', ''))}
+          {input_text('merchant_serial_no', '商户证书序列号', config.get('merchant_serial_no', ''))}
+          {input_text('notify_url', '支付回调地址', config.get('notify_url') or callback_url)}
+          {input_text('api_v3_key', 'API v3 密钥', '', 'password', mask_saved(config.get('api_v3_key')))}
+          {textarea_field('private_key_pem', '商户 API 私钥 PEM', config.get('private_key_pem'), secret=True)}
+          {textarea_field('platform_cert_pem', '微信支付平台证书 PEM', config.get('platform_cert_pem'), secret=True)}
+        """
+    else:
+        title = "支付宝"
+        notify_url = PUBLIC_SUB_BASE.rstrip("/") + "/payment/alipay/notify"
+        return_url = PUBLIC_SUB_BASE.rstrip("/") + "/dashboard"
+        fields = f"""
+          {input_text('app_id', '应用 AppID', config.get('app_id', ''))}
+          {input_text('gateway_url', '网关地址', config.get('gateway_url') or 'https://openapi.alipay.com/gateway.do')}
+          {input_text('notify_url', '异步通知地址', config.get('notify_url') or notify_url)}
+          {input_text('return_url', '同步返回地址', config.get('return_url') or return_url)}
+          {input_text('sign_type', '签名类型', config.get('sign_type') or 'RSA2')}
+          {textarea_field('merchant_private_key', '应用私钥', config.get('merchant_private_key'), secret=True)}
+          {textarea_field('alipay_public_key', '支付宝公钥', config.get('alipay_public_key'), secret=True)}
+        """
+    return f"""
+    <section class="panel payment-panel">
+      <div class="panel-title">
+        <h2>{title}</h2>
+        <span class="{badge_class}">{badge_text}</span>
+      </div>
+      <form method="post" action="/admin/payments" class="form">
+        <input type="hidden" name="provider" value="{provider}">
+        <label class="check"><input name="enabled" type="checkbox" {enabled}> 启用{title}</label>
+        <div class="settings-grid">{fields}</div>
+        <button type="submit">保存{title}配置</button>
+      </form>
+    </section>
+    """
+
+
+def payment_method_choices(enabled_methods):
+    options = []
+    labels = {"wechat": "微信支付", "alipay": "支付宝"}
+    for provider in enabled_methods:
+        options.append(
+            f"""
+            <label class="pay-option">
+              <input type="radio" name="payment_method" value="{provider}" required>
+              <span><b>{labels[provider]}</b><small>创建支付订单，付款后等待后台确认开通</small></span>
+            </label>
+            """
+        )
+    options.append(
+        """
+        <label class="pay-option">
+          <input type="radio" name="payment_method" value="manual" required>
+          <span><b>人工确认</b><small>用于测试或人工收款，提交后按现有流程自动开通</small></span>
+        </label>
+        """
+    )
+    return "<div class='pay-options'>" + "".join(options) + "</div>"
+
+
+def payment_pending_page(order, provider, tx):
+    label = "微信支付" if provider == "wechat" else "支付宝"
+    return f"""
+    <section class="panel narrow">
+      <h1>{label}</h1>
+      <dl class="kv">
+        <dt>订单号</dt><dd>{html.escape(order['order_no'])}</dd>
+        <dt>支付单号</dt><dd>{html.escape(tx['provider_order_no'])}</dd>
+        <dt>套餐</dt><dd>{html.escape(order['product_name'])}</dd>
+        <dt>金额</dt><dd>{money(order['amount_cents'])}</dd>
+        <dt>状态</dt><dd>支付意向已创建，等待收款确认</dd>
+      </dl>
+      <div class="payment-placeholder">{label}<br><span>真实二维码/收银台将在接入支付 API 后显示</span></div>
+      <p class="muted">当前系统已记录支付意向。收到款项后，管理员可在订单管理中点击“确认收款并开通”。</p>
+      <div class="actions"><a class="button" href="/dashboard">返回用户中心</a></div>
+    </section>
+    """
+
+
+def product_form(action, p=None):
+    p = dict(p) if p is not None else {}
+    checked = "checked" if p.get("active", 1) else ""
+    price_yuan = (p.get("price_cents", 0) or 0) / 100
+    return f"""
+    <form method="post" action="{action}" class="form grid-form">
+      <label>名称<input name="name" value="{html.escape(str(p.get('name','')))}" required></label>
+      <label>周期
+        <select name="billing_period">
+          {option('monthly','月付',p.get('billing_period'))}
+          {option('quarterly','季度',p.get('billing_period'))}
+          {option('yearly','包年',p.get('billing_period'))}
+        </select>
+      </label>
+      <label>有效天数<input name="duration_days" type="number" min="1" value="{p.get('duration_days',30)}" required></label>
+      <label>流量 GB<input name="traffic_gb" type="number" min="1" value="{p.get('traffic_gb',100)}" required></label>
+      <label>价格 元<input name="price_yuan" type="number" min="0" step="0.01" value="{price_yuan:.2f}" required></label>
+      <label>排序<input name="sort_order" type="number" value="{p.get('sort_order',100)}"></label>
+      <label class="check"><input name="active" type="checkbox" {checked}> 上架</label>
+      <button type="submit">保存</button>
+    </form>
+    """
+
+
+def option(value, label, selected):
+    return f"<option value='{value}' {'selected' if selected == value else ''}>{label}</option>"
+
+
+def product_row(p):
+    status = "上架" if p["active"] else "下架"
+    return f"<tr><td>{html.escape(p['name'])}</td><td>{duration_label(p['duration_days'])}</td><td>{gb_label(p['traffic_gb'])}</td><td>{money(p['price_cents'])}</td><td>{status}</td><td><a href='/admin/products/{p['id']}/edit'>编辑</a></td></tr>"
+
+
+def order_row(o, admin=False, customer=False):
+    if admin:
+        actions = []
+        if o["status"] == "pending_payment":
+            actions.append(f"<form method='post' action='/admin/orders/{o['id']}/mark-paid'><button>确认收款并开通</button></form>")
+        if o["status"] == "provision_failed":
+            actions.append(f"<form method='post' action='/admin/orders/{o['id']}/provision'><button>重试开通</button></form>")
+        action = "".join(actions) or "-"
+        return f"<tr><td>{html.escape(o['order_no'])}</td><td>{html.escape(o['user_email'])}</td><td>{html.escape(o['product_name'])}</td><td>{money(o['amount_cents'])}</td><td><span class='badge'>{o['status']}</span></td><td>{action}</td></tr>"
+    action = f"<a href='/checkout?id={o['id']}'>去支付</a>" if o["status"] == "pending_payment" else "-"
+    return f"<tr><td>{html.escape(o['order_no'])}</td><td>{html.escape(o['product_name'])}</td><td>{money(o['amount_cents'])}</td><td><span class='badge'>{o['status']}</span></td><td>{action}</td></tr>"
+
+
+def build_node_url(s):
+    query = {
+        "type": "tcp",
+        "security": "reality",
+        "encryption": "none",
+        "flow": "xtls-rprx-vision",
+        "fp": "chrome",
+        "pbk": NODE_REALITY_PUBLIC_KEY,
+        "sni": NODE_REALITY_SNI,
+        "sid": NODE_REALITY_SHORT_ID,
+        "spx": "/",
+    }
+    remark = f"{NODE_REMARK_PREFIX}-{s['sub_id']}"
+    return (
+        f"vless://{urllib.parse.quote(str(s['uuid']), safe='')}@{NODE_PUBLIC_HOST}:{NODE_DIRECT_PORT}"
+        f"?{urllib.parse.urlencode(query)}#{urllib.parse.quote(remark)}"
+    )
+
+
+def copy_button(label, value, extra_class=""):
+    if not value:
+        return f"<button class='copy-action {extra_class}' type='button' disabled>{label}</button>"
+    return f"<button class='copy-action {extra_class}' type='button' data-copy-value='{html.escape(value, quote=True)}'>{label}</button>"
+
+
+def shortcut_panel(s):
+    node_url = build_node_url(s) if s else ""
+    sub_url = s["clash_url"] if s else ""
+    return f"""
+    <section id="guide" class="n-card shortcut-card">
+      <div class="n-card-header"><h2>捷径</h2></div>
+      <div class="n-card-content shortcut-list">
+        <div class="shortcut-row">
+          <div><b>一键拷贝节点</b><p>复制单节点链接，适合 Clash 类客户端手动添加。</p></div>
+          {copy_button("复制", node_url)}
+        </div>
+        <div class="shortcut-row">
+          <div><b>一键拷贝订阅</b><p>复制 Clash / Mihomo 订阅地址，推荐通过 URL 导入。</p></div>
+          {copy_button("复制", sub_url)}
+        </div>
+        <a class="shortcut-row" href="/plans">
+          <div><b>续费订阅</b><p>对当前节点服务购买或续期。</p></div>
+          <span class="row-arrow">></span>
+        </a>
+        <a class="shortcut-row" href="/forgot-password">
+          <div><b>账户安全</b><p>忘记密码时通过邮箱重置。</p></div>
+          <span class="row-arrow">></span>
+        </a>
+      </div>
+    </section>
+    """
+
+
+def empty_subscription_card():
+    return """
+    <div class="empty-state">
+      <h3>暂无已开通订阅</h3>
+      <p>购买套餐并完成开通后，这里会显示订阅状态、到期时间和复制入口。</p>
+      <a class="button" href="/plans">购买订阅</a>
+    </div>
+    """
+
+
+def subscription_card(s):
+    node_url = build_node_url(s)
+    return f"""
+    <article class="sub-card">
+      <div class="sub-main">
+        <h3>通用订阅</h3>
+        <p>于 {ms_to_date(s['expires_at'])} 到期。</p>
+        <div class="usage-line"><span style="width: 0%"></span></div>
+        <p class="traffic-note">总计 {gb_label(s['traffic_bytes'] / 1024**3)} · 开通状态：{html.escape(s['xui_status'])}</p>
+      </div>
+      <div class="sub-actions">
+        {copy_button("复制节点", node_url)}
+        {copy_button("复制订阅", s['clash_url'], "secondary")}
+      </div>
+    </article>
+    """
+
+
+if __name__ == "__main__":
+    init_db()
+    print(f"Subscription shop running at http://{HOST}:{PORT}")
+    print(f"XUI_MODE={XUI_MODE}")
+    ThreadingHTTPServer((HOST, PORT), App).serve_forever()
